@@ -29,12 +29,15 @@ from ryu.controller import ofp_event
 from ryu.controller.handler import CONFIG_DISPATCHER, MAIN_DISPATCHER
 from ryu.controller.handler import set_ev_cls
 from ryu.ofproto import ofproto_v1_3
+from ryu.lib import ip
 from ryu.lib.packet import packet
 from ryu.lib.packet import ethernet, arp, ipv4
 from ryu.lib.packet import ether_types
 import ryu.topology.api as api
 
-import time
+from Queue import PriorityQueue
+
+import time, cProfile, pstats, StringIO
 
 class NixMpls13(app_manager.RyuApp):
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
@@ -63,19 +66,31 @@ class NixMpls13(app_manager.RyuApp):
 
     @set_ev_cls(ofp_event.EventOFPPortDescStatsReply, CONFIG_DISPATCHER)
     def port_desc_handler(self, ev):
+        pr,start = self.enableProf()
+
         datapath = ev.msg.datapath
         ofproto = datapath.ofproto
         parser = datapath.ofproto_parser
 
         for port in datapath.ports:
-            self.logger.info("%s has port %s", datapath, port)
-            mpls_match = parser.OFPMatch()
-            mpls_match.set_dl_type(ether_types.ETH_TYPE_MPLS)
-            mpls_match.set_mpls_label(port)
-            mpls_actions = [parser.OFPActionPopMpls(ether_types.ETH_TYPE_MPLS),
-                            parser.OFPActionOutput(port)]
-            self.add_flow(datapath, 10, mpls_match, mpls_actions)
-            time.sleep(0.01)
+            if port != ofproto.OFPP_LOCAL:
+                    mpls_match = parser.OFPMatch()
+                    mpls_match.append_field(ofproto.OXM_OF_ETH_TYPE, ether_types.ETH_TYPE_MPLS)
+                    mpls_match.append_field(ofproto.OXM_OF_MPLS_LABEL, port)
+                    mpls_match.append_field(ofproto.OXM_OF_MPLS_BOS, 0)
+                    mpls_actions = [parser.OFPActionPopMpls(ether_types.ETH_TYPE_MPLS),
+                                    parser.OFPActionOutput(port)]
+                    self.add_flow(datapath, 10, mpls_match, mpls_actions)
+
+                    mpls_match = parser.OFPMatch()
+                    mpls_match.append_field(ofproto.OXM_OF_ETH_TYPE, ether_types.ETH_TYPE_MPLS)
+                    mpls_match.append_field(ofproto.OXM_OF_MPLS_LABEL, port)
+                    mpls_match.append_field(ofproto.OXM_OF_MPLS_BOS, 1)
+                    mpls_actions = [parser.OFPActionPopMpls(ether_types.ETH_TYPE_IP),
+                                    parser.OFPActionOutput(port)]
+                    self.add_flow(datapath, 10, mpls_match, mpls_actions)
+
+        self.disableProf(pr,start,"PORTDESC")
 
     def add_flow(self, datapath, priority, match, actions, table_id=0, buffer_id=None):
         ofproto = datapath.ofproto
@@ -92,7 +107,6 @@ class NixMpls13(app_manager.RyuApp):
             mod = parser.OFPFlowMod(datapath=datapath, priority=priority,
                                     table_id=table_id,
                                     match=match, instructions=inst)
-        self.logger.info("Sending new flow to add: %s", mod)
         datapath.send_msg(mod)
 
     def mod_flow(self, datapath, priority, match, actions, table_id=0, buffer_id=None):
@@ -113,12 +127,10 @@ class NixMpls13(app_manager.RyuApp):
                                     command=ofproto.OFPFC_MODIFY,
                                     table_id=table_id,
                                     instructions=inst)
-        self.logger.info("Sending new flow to mod: %s", mod)
         datapath.send_msg(mod)
 
     @set_ev_cls(ofp_event.EventOFPPacketIn, MAIN_DISPATCHER)
     def _packet_in_handler(self, ev):
-        
         # If you hit this you might want to increase
         # the "miss_send_length" of your switch
         if ev.msg.msg_len < ev.msg.total_len:
@@ -136,37 +148,31 @@ class NixMpls13(app_manager.RyuApp):
         if eth.ethertype == ether_types.ETH_TYPE_LLDP:
             # ignore lldp packet
             return
-        
-        dst = eth.dst
-        src = eth.src
-
-        dpid = datapath.id
+        pr,start = self.enableProf()
         
         # Figure out environment
         links = api.get_all_link(self)
         switches = api.get_all_switch(self)
         hosts = api.get_all_host(self)
-        
-        arp_pkt = None
+
         if eth.ethertype == ether_types.ETH_TYPE_ARP:
             arp_pkt = pkt.get_protocols(arp.arp)[0]
             if arp_pkt.opcode == arp.ARP_REQUEST:
                 # Send to ARP proxy. Cannot perform NIx routing until both hosts
                 # are known by the controller
                 self.ArpProxy (msg.data, datapath, in_port, links, switches, hosts)
-                return
             elif arp_pkt.opcode == arp.ARP_REPLY:
                 self.ArpReply (msg.data, datapath, arp_pkt.dst_ip, links, switches, hosts)
-                return
+            self.disableProf(pr,start,"ARP")
+            return
         
-        self.logger.info("%s: packet in %s %s %s %s %s", time.time(), dpid, src, dst, in_port, eth.ethertype)
+        #self.logger.info("%s: packet in %s %s %s %s %s", time.time(), dpid, src, dst, in_port, eth.ethertype)
         
-        # Start nix vector code        
-        numNodes = len(switches) + len(hosts)
+        # Start nix vector code
         src_ip = ''
         dst_ip = ''
-        srcNode = ''
-        dstNode = ''
+        srcNode = None
+        dstNode = None
         if eth.ethertype == ether_types.ETH_TYPE_ARP:
             arp_pkt = pkt.get_protocols(arp.arp)[0]
             src_ip = arp_pkt.src_ip
@@ -181,11 +187,27 @@ class NixMpls13(app_manager.RyuApp):
             if dst_ip == host.ipv4[0]:
                 dstNode = host
         
+        if srcNode is None or dstNode is None:
+            self.ArpProxy (msg.data, datapath, in_port, links, switches, hosts)
+            self.disableProf(pr,start,"UNKDST")
+            return
         srcSwitch = [switch for switch in switches if switch.dp.id == srcNode.port.dpid][0]
         dstSwitch = [switch for switch in switches if switch.dp.id == dstNode.port.dpid][0]
+
+        # Send reverse path first
         parentVec = {}
-        foundIt = self.BFS (numNodes, srcSwitch, dstSwitch,
-                                       links, switches, hosts, parentVec)
+        foundIt = self.UCS (dstSwitch, srcSwitch, links, switches, parentVec)
+        
+        sdnNix = []
+        nixVector = []
+        if foundIt:
+            self.BuildNixVector (parentVec, dstSwitch, srcSwitch, links, switches, hosts, nixVector, sdnNix)
+            
+            sdnNix.insert(0, (srcSwitch, srcNode.port.port_no))
+            self.sendNixPacket (ofproto, parser, dstSwitch, sdnNix, msg, dst_ip, src_ip, False)
+
+        parentVec = {}
+        foundIt = self.UCS (srcSwitch, dstSwitch, links, switches, parentVec)
         
         sdnNix = []
         nixVector = []
@@ -193,11 +215,10 @@ class NixMpls13(app_manager.RyuApp):
             self.BuildNixVector (parentVec, srcSwitch, dstSwitch, links, switches, hosts, nixVector, sdnNix)
             
             sdnNix.insert(0, (dstSwitch, dstNode.port.port_no))
-            self.sendNixPacket (ofproto, parser, srcSwitch, sdnNix, msg)
-
-            self.modLastHop (ofproto, parser, dstSwitch, dstNode.port.port_no, msg)
+            self.sendNixPacket (ofproto, parser, srcSwitch, sdnNix, msg, src_ip, dst_ip)
+        self.disableProf(pr,start,"COMPLETION")
         
-    def ArpProxy (self, data, datapath, in_port, links, switches, hosts):
+    def ArpProxy(self, data, datapath, in_port, links, switches, hosts):
         for switch in switches:
             # Get all usable ports for this switch and then remove those ports
             # associated with switch-to-switch connections to look at edge ports
@@ -216,10 +237,10 @@ class NixMpls13(app_manager.RyuApp):
                                               in_port=switch.dp.ofproto.OFPP_CONTROLLER,
                                               actions=actions, data=data)
                     
-                    self.logger.info("%s: Sending ARP Request: dpid=%s, port=%s", time.time(), switch.dp.id, port)
+                    #self.logger.info("%s: Sending ARP Request: dpid=%s, port=%s", time.time(), switch.dp.id, port)
                     switch.dp.send_msg(out)
 
-    def ArpReply (self, data, datapath, dst_ip, links, switches, hosts):
+    def ArpReply(self, data, datapath, dst_ip, links, switches, hosts):
         for host in hosts:
             for switch in switches:
                 # Push an ARP reply out of the appropriate switch port
@@ -230,32 +251,39 @@ class NixMpls13(app_manager.RyuApp):
                                               in_port=switch.dp.ofproto.OFPP_CONTROLLER,
                                               actions=actions, data=data)
 
-                    self.logger.info("%s: Sending ARP Reply: dpid=%s, port=%s", time.time(), switch.dp.id, host.port.port_no)
+                    #self.logger.info("%s: Sending ARP Reply: dpid=%s, port=%s", time.time(), switch.dp.id, host.port.port_no)
                     switch.dp.send_msg(out)
         
-    def BFS (self, nNodes, srcSwitch, dstSwitch, links, switches, hosts, parentVector):
-        greyNodeList = [ srcSwitch ]
-        
-        parentVector[srcSwitch.dp.id] = greyNodeList[0]
-        while len(greyNodeList) != 0:
-            currNode = greyNodeList[0]
-            if (currNode == dstSwitch):
-                return True
-              
-            for link in links:
-                if link.src.dpid == currNode.dp.id:
-                    if not link.dst.is_live():
-                        continue
-                
-                    if parentVector.get(link.dst.dpid) == None:
-                        parentVector[link.dst.dpid] = currNode
-                        currSwitch = [switch for switch in switches if switch.dp.id == link.dst.dpid][0]
-                        greyNodeList.append(currSwitch)
-            del(greyNodeList[0])
-                         
+    def UCS(self, srcSwitch, dstSwitch, links, switches, parentVector):
+        parentVector[srcSwitch.dp.id] = srcSwitch
+        visited = set()
+        q = PriorityQueue()
+        q.put((0, srcSwitch, []))
+
+        while q:
+            cost, point, path = q.get()
+            if point not in visited:
+                visited.add(point)
+
+                path = path + [point]
+                if point == dstSwitch:
+                    for index in range(1,len(path)):
+                        parentVector[path[index].dp.id] = path[index-1]
+                    self.logger.info("Cost: %f", cost)
+                    return True
+
+                for link in links:
+                    if link.src.dpid == point.dp.id:
+                        if not link.dst.is_live():
+                            continue
+
+                        child = [switch for switch in switches if switch.dp.id == link.dst.dpid][0]
+                        if child not in visited:
+                            total_cost = cost + link.delay
+                            q.put((total_cost,child, path))
         return False
     
-    def BuildNixVector (self, parentVector, srcSwitch, dstSwitch, links, switches, hosts, nixVector, sdnNix):
+    def BuildNixVector(self, parentVector, srcSwitch, dstSwitch, links, switches, hosts, nixVector, sdnNix):
         if srcSwitch == dstSwitch:
             return True
         
@@ -279,64 +307,56 @@ class NixMpls13(app_manager.RyuApp):
         if totalNeighbors > 1:
             newNix = [int(c) for c in self.bin(destId)[2:]]
             nixVector.extend(newNix)
-        self.logger.info("SDN Nix: %s", sdnNix)
+        #self.logger.info("SDN Nix: %s", sdnNix)
         return self.BuildNixVector(parentVector, srcSwitch, parentSwitch, links, switches, hosts, nixVector, sdnNix)
     
-    def modLastHop (self, ofproto, parser, switch, port_no, msg):
-        mpls_match = parser.OFPMatch()
-        mpls_match.set_dl_type(ether_types.ETH_TYPE_MPLS)
-        mpls_match.set_mpls_label(port_no)
-        mpls_actions = [parser.OFPActionPopMpls(ether_types.ETH_TYPE_IP),
-                        parser.OFPActionSetField(eth_type=ether_types.ETH_TYPE_IP),
-                        parser.OFPActionSetField(eth_src=msg.match['eth_src']),
-                        parser.OFPActionSetField(eth_dst=msg.match['eth_dst']),
-                        parser.OFPActionOutput(port_no)]
-        
-        self.mod_flow(switch.dp, 10, mpls_match, mpls_actions)                    
-        self.logger.info("%s: Sending Nix rule: dpid=%s, port=%s", time.time(), switch.dp.id, port_no)
-
-    def sendNixPacket(self, ofproto, parser, srcSwitch, sdnNix, msg):
-        # Only set up rule to change eth_type if this will not be a single hop
-        ps_actions = [parser.OFPActionSetField(eth_type=ether_types.ETH_TYPE_MPLS)]
-        if len(sdnNix) > 0:
-            ps_inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, ps_actions),
-                       parser.OFPInstructionGotoTable(table_id=1)]
-            ps_match = parser.OFPMatch(eth_type=ether_types.ETH_TYPE_IP,
-                                       eth_src=msg.match['eth_src'],
-                                       eth_dst=msg.match['eth_dst'])
-            ps_mod = parser.OFPFlowMod(datapath=srcSwitch.dp, priority=20,
-                                       match=ps_match, instructions=ps_inst)
-            srcSwitch.dp.send_msg(ps_mod)
-            
+    def sendNixPacket(self, ofproto, parser, srcSwitch, sdnNix, msg, src_ip, dst_ip, po=True):
         actions = []
-        out_port = 0        
+        out_port = 0
+        first = 1        
         for curNix in sdnNix:
             if curNix[0] == srcSwitch:
                 # Save the output port from the source switch
                 out_port = curNix[1]
             else:
-                self.logger.info ("Switch %s send out port %s", curNix[0].dp.id, curNix[1])
+                #self.logger.info ("Switch %s send out port %s", curNix[0].dp.id, curNix[1])
                 actions.append(parser.OFPActionPushMpls())
-                actions.append(parser.OFPActionSetMplsTtl(7))
+                actions.append(parser.OFPActionSetField(mpls_ttl=64))
                 actions.append(parser.OFPActionSetField(mpls_label=curNix[1]))
         actions.append(parser.OFPActionOutput(out_port))
 
         inst = [parser.OFPInstructionActions(ofproto.OFPIT_APPLY_ACTIONS, actions)]
-        match = parser.OFPMatch(in_port=msg.match['in_port'],eth_type=ether_types.ETH_TYPE_MPLS)
-        mod = parser.OFPFlowMod(datapath=srcSwitch.dp, priority=10, table_id=1,
+        match = parser.OFPMatch()
+        match.append_field(ofproto.OXM_OF_ETH_TYPE, ether_types.ETH_TYPE_IP)
+        # Hack for GENI since it gives the "wrong" MAC addresses... Will still work fine for ns-3
+        match.append_field(ofproto.OXM_OF_IPV4_SRC, ip.ipv4_to_int(src_ip), ip.text_to_int("255.255.0.0"))
+        match.append_field(ofproto.OXM_OF_IPV4_DST, ip.ipv4_to_int(dst_ip), ip.text_to_int("255.255.0.0"))
+        mod = parser.OFPFlowMod(datapath=srcSwitch.dp, priority=10, table_id=0,
                                 match=match, instructions=inst)
         srcSwitch.dp.send_msg(mod)
         
-        data = None
-        if msg.buffer_id == ofproto.OFP_NO_BUFFER:
-            data = msg.data
+        if po == True:
+            data = None
+            if msg.buffer_id == ofproto.OFP_NO_BUFFER:
+                data = msg.data
 
-        if len(sdnNix) > 1:
-            actions.insert(0, ps_actions[0])
-        out = parser.OFPPacketOut(datapath=srcSwitch.dp, buffer_id=msg.buffer_id,
-                                  in_port=msg.match['in_port'],
-                                  actions=actions, data=data)
-        srcSwitch.dp.send_msg(out)
+            out = parser.OFPPacketOut(datapath=srcSwitch.dp, buffer_id=msg.buffer_id,
+                                      in_port=msg.match['in_port'],
+                                      actions=actions, data=data)
+            srcSwitch.dp.send_msg(out)
         
     def bin(self, s):
         return str(s) if s<=1 else bin(s>>1) + str(s&1)
+
+    def enableProf(self):
+        pr = cProfile.Profile()
+        pr.enable()
+        return pr,time.time()
+
+    def disableProf(self, pr, start, whichcase):
+        completion = time.time() - start
+        pr.disable()
+        s = StringIO.StringIO()
+        ps = pstats.Stats(pr, stream=s)
+        ps.print_stats(0)
+        self.logger.info("%s\t%f\t%s", whichcase, completion, s.getvalue())
